@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只暴露更新用的目录，其它私有文件一律不对外。
+  getExternalFilesDir("update") → external-files-path
+  cacheDir/update（外部存储不可用时的兜底）→ cache-path
+-->
+<paths>
+    <external-files-path name="update" path="update/" />
+    <cache-path name="update_cache" path="update/" />
+</paths>

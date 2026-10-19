@@ -1,0 +1,121 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 配置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # 显式装齐，避免 AGP 运行时再下载导致构建不稳定
+          packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
+
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 还原签名证书
+        env:
+          KEYSTORE_B64: ${{ secrets.VA_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::缺少 VA_KEYSTORE_BASE64。没有固定签名，产出的 APK 无法覆盖安装手机上已装的版本。"
+            echo "::error::请参考仓库说明，把 keystore 转成 base64 后填进 Settings → Secrets → Actions。"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/signing.jks"
+          echo "VA_KEYSTORE_PATH=$RUNNER_TEMP/signing.jks" >> "$GITHUB_ENV"
+
+      - name: 构建 release APK
+        env:
+          # 默认值对应 Android 自动生成的 debug 证书；换成自己的 release 证书时用 secrets 覆盖
+          VA_KEYSTORE_PASSWORD: ${{ secrets.VA_KEYSTORE_PASSWORD || 'android' }}
+          VA_KEY_ALIAS: ${{ secrets.VA_KEY_ALIAS || 'androiddebugkey' }}
+          VA_KEY_PASSWORD: ${{ secrets.VA_KEY_PASSWORD || 'android' }}
+        run: |
+          chmod +x ./gradlew
+          # 仓库里的 gradle.properties 是按本机 1~2GB 可用内存压过的，CI 机器内存充足，这里放宽
+          ./gradlew assembleRelease --no-daemon --stacktrace \
+            -PupdateRepo=${{ github.repository }} \
+            -PversionName=0.7.${{ github.run_number }} \
+            -Dorg.gradle.jvmargs="-Xmx2g -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8" \
+            -Dorg.gradle.workers.max=2
+
+      - name: 记录版本信息并生成更新清单
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+          AAPT2="$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          DUMP=$("$AAPT2" dump badging "$APK")
+          CODE=$(echo "$DUMP" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -n 1)
+          NAME=$(echo "$DUMP" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          SIZE=$(stat -c%s "$APK")
+
+          cat > update.json <<EOF
+          {
+            "versionCode": $CODE,
+            "versionName": "$NAME",
+            "apkUrl": "https://github.com/${{ github.repository }}/releases/latest/download/app-release.apk",
+            "sha256": "$SHA",
+            "size": $SIZE,
+            "notes": "提交 ${GITHUB_SHA:0:7}"
+          }
+          EOF
+
+          echo "### 构建产物" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 版本：$NAME ($CODE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 文件：\`$(basename "$APK")\` $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 提交：${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          cat update.json
+          ls -l "$APK"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: voiceassistant-apk
+          path: |
+            app/build/outputs/apk/release/*.apk
+            update.json
+          if-no-files-found: error
+
+      - name: 清理旧的滚动发布
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release delete latest --yes --cleanup-tag
+
+      - name: 发布到 Release（最新构建）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 最新构建
+          body: |
+            自动构建，提交 `${{ github.sha }}`。
+
+            手机下载地址（长期有效，永远指向最新一次构建）：
+            `https://github.com/${{ github.repository }}/releases/latest/download/app-release.apk`
+
+            应用内更新清单（App 自己读这个判断有没有新版本）：
+            `https://github.com/${{ github.repository }}/releases/latest/download/update.json`
+          files: |
+            ${{ env.APK }}
+            update.json
+          make_latest: true

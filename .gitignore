@@ -1,0 +1,23 @@
+# 构建产物
+build/
+app/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Gradle / IDE
+.gradle/
+.idea/
+.kotlin/
+*.iml
+local.properties
+hs_err_pid*.log
+
+# 签名材料：绝不入库
+keystore.properties
+*.jks
+*.keystore
+
+# 系统
+.DS_Store
+Thumbs.db
