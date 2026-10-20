@@ -14,6 +14,11 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.example.voiceassistant.agent.SubTask
+import com.example.voiceassistant.agent.TaskAgent
+import com.example.voiceassistant.agent.TaskPlanner
+import com.example.voiceassistant.agent.TaskState
+import com.example.voiceassistant.agent.TaskStore
 import com.example.voiceassistant.assistant.JarvisPrompts
 import com.example.voiceassistant.assistant.WakeWord
 import com.example.voiceassistant.asr.AsrEngine
@@ -33,6 +38,7 @@ import com.example.voiceassistant.overlay.FloatingBallController
 import com.example.voiceassistant.state.AssistantStateBus
 import com.example.voiceassistant.tts.SystemTtsManager
 import com.example.voiceassistant.util.PermissionHelper
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -83,15 +89,34 @@ class AssistantService : Service() {
     /** 上层是否希望麦继续开着（暂停后据此决定要不要恢复），避免暂停变成"永久关麦" */
     private var keepListening = false
 
+    /** 多步任务同一时刻只允许一个，避免两句话把手机点乱 */
+    @Volatile
+    private var agentRunning = false
+
+    /** 任务状态落盘：进程被杀后还能知道上次做到第几步 */
+    private lateinit var taskStore: TaskStore
+
     override fun onCreate() {
         super.onCreate()
         NotificationHelper.ensureChannel(this)
         floatingBall = FloatingBallController(this)
         confirmDialog = ConfirmDialogController(this)
+        taskStore = TaskStore(this)
+
+        // 上次任务没跑完（多半是进程被系统杀了）：这里只提示，不擅自重跑——
+        // 手机可能已经换了界面，突然自己动起来比不做更吓人
+        taskStore.load()?.takeIf { it.unfinished }?.let { saved ->
+            ServiceLocator.logRepository.add(
+                LogStage.SYSTEM,
+                "上次任务没做完（停在第${saved.cursor + 1}/${saved.subtasks.size}步），说「继续」可以接着做"
+            )
+        }
 
         asrEngine = SystemAsrEngine(this).apply {
             setListener(asrListener)
         }
+        // 只用它的「规则匹配 + 危险确认」这一半：LLM 兜底故意留空，
+        // 规则不认的句子交给 TaskAgent 分步去做（单步 LLM 解析干不了多步活）
         intentParser = CompositeIntentParser()
         executor = AccessibilityActionExecutor(this) { ServiceLocator.accessibilityService }
 
@@ -347,6 +372,7 @@ class AssistantService : Service() {
      */
     private fun dispatchRecognized(text: String) {
         if (handleSpokenConfirm(text)) return
+        if (tryResumeTask(text)) return
 
         if (WakeWord.matches(text)) {
             val command = WakeWord.strip(text)
@@ -415,6 +441,9 @@ class AssistantService : Service() {
                 }
                 return@launch
             }
+
+            // 规则不认 → 先试多步执行；模型判断"这不是操作任务"才回到聊天
+            if (runAgentForTask(text)) return@launch
 
             // 规则不认 → 聊天
             AssistantStateBus.update { it.copy(statusText = "贾维斯在想…") }
@@ -582,17 +611,250 @@ class AssistantService : Service() {
                 is ParseResult.Rejected -> {
                     ServiceLocator.logRepository.add(
                         LogStage.INTENT,
-                        "未理解：${result.reason}",
-                        ok = false,
+                        "规则未命中，交给多步执行",
                         input = text,
                         costMillis = cost
                     )
+                    // 规则不认的句子以前直接"没听懂"，现在先当任务试一次：
+                    // 模型能拆步骤就真的去做（这才是"能干活"）
+                    if (runAgentForTask(text)) return@launch
+
                     AssistantStateBus.update { it.copy(statusText = "没听懂") }
                     toast("没听懂：${text}")
                     resumeIfShould()
                 }
             }
         }
+    }
+
+    /**
+     * 用户说「继续」，且落盘状态里还有没做完的子任务 → 接着跑。
+     *
+     * 只在整句就是"继续"这类词时触发，避免把"继续播放"当成续做任务。
+     */
+    private fun tryResumeTask(text: String): Boolean {
+        val normalized = text.trim().trim('。', '，', ',', '！', '!', '.', ' ')
+        if (normalized !in RESUME_WORDS) return false
+
+        val saved = taskStore.load() ?: return false
+        if (!saved.unfinished) return false
+
+        ServiceLocator.logRepository.add(
+            LogStage.SYSTEM,
+            "接着做上次没完成的：${saved.utterance}（从第${saved.cursor + 1}步继续）"
+        )
+        scope.launch { runPlan(saved) }
+        return true
+    }
+
+    // ---------------- 多步任务执行（"能干活"的那一环） ----------------
+
+    /**
+     * 把一句话当"任务"办：引擎先拆子目标，再逐个执行。
+     *
+     * 分工是刻意的（小模型的活法）：
+     *  - 拆任务、记进度、控轮次 = 引擎（离线、确定性、不花 token）
+     *  - 每一步怎么做        = 模型（一次只出一个动作，每个子目标最多跑几步）
+     *  - 单步就能用规则办的  = 直接执行，根本不叫模型
+     *
+     * @return true 表示已处理掉；false 表示模型判定这不是操作手机的任务（调用方回去聊天）
+     */
+    private suspend fun runAgentForTask(text: String): Boolean {
+        val settings = ServiceLocator.jarvisSettings
+        if (!settings.llmConfigured) return false
+
+        if (ServiceLocator.accessibilityService == null) {
+            ServiceLocator.logRepository.add(
+                LogStage.SYSTEM,
+                "需要无障碍权限才能替你操作手机，请到「权限」页开启",
+                ok = false
+            )
+            return false
+        }
+
+        if (agentRunning) {
+            speak("上一个任务还在做，等它做完")
+            return true
+        }
+
+        val target = text.trim()
+        if (target.isEmpty()) return false
+
+        val goals = TaskPlanner.split(target)
+        if (goals.isEmpty()) return false
+
+        val now = System.currentTimeMillis()
+        val state = TaskState(
+            utterance = target,
+            createdAt = now,
+            updatedAt = now,
+            subtasks = goals.map { SubTask(it) }
+        )
+        ServiceLocator.logRepository.add(
+            LogStage.SYSTEM,
+            "拆成 ${goals.size} 步：" + goals.joinToString("；"),
+            input = target
+        )
+        return runPlan(state)
+    }
+
+    /** 按任务状态往下跑；进程被杀后凭落盘状态可以接着来 */
+    private suspend fun runPlan(state: TaskState): Boolean {
+        agentRunning = true
+        var current = state
+        try {
+            taskStore.save(current)
+            val total = current.subtasks.size
+            var index = current.cursor
+
+            while (index < total) {
+                val goal = current.subtasks[index].goal
+                val label = "第${index + 1}/$total 步：$goal"
+                AssistantStateBus.update { it.copy(statusText = label) }
+                updateNotification(label)
+                ServiceLocator.logRepository.add(LogStage.SYSTEM, label)
+
+                var result = runSubtask(goal)
+                if (result is SubtaskResult.NotATask) {
+                    // 第一步就判定"不是操作任务" → 整句交给聊天；后面的步这么判就当失败
+                    if (index == 0) return false
+                    result = SubtaskResult.Fail("模型判断这一步不是操作任务")
+                }
+
+                when (result) {
+                    is SubtaskResult.Ok -> {
+                        current = current.copy(
+                            subtasks = current.subtasks.mark(index, SubTask.DONE, result.note),
+                            cursor = index + 1,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        taskStore.save(current)
+                        ServiceLocator.logRepository.add(
+                            LogStage.EXECUTE, "第${index + 1}步完成：${result.note}"
+                        )
+                        index++
+                    }
+
+                    is SubtaskResult.Fail -> {
+                        current = current.copy(
+                            subtasks = current.subtasks.mark(index, SubTask.FAILED, result.message),
+                            cursor = index,
+                            finished = false,
+                            updatedAt = System.currentTimeMillis()
+                        )
+                        taskStore.save(current)
+                        ServiceLocator.logRepository.add(
+                            LogStage.EXECUTE,
+                            "第${index + 1}步失败：${result.message}",
+                            ok = false
+                        )
+                        // 不做静默跳过：后面几步往往依赖这一步的结果
+                        speak("第${index + 1}步没做成：${result.message}")
+                        return true
+                    }
+
+                    SubtaskResult.NotATask -> return false
+                }
+            }
+
+            current = current.copy(
+                finished = true,
+                cursor = total,
+                updatedAt = System.currentTimeMillis()
+            )
+            taskStore.save(current)
+
+            val summary = if (total == 1) {
+                current.subtasks.first().note.ifBlank { "做完了" }
+            } else {
+                "都做完了，一共 $total 步"
+            }
+            ServiceLocator.logRepository.add(LogStage.EXECUTE, "任务完成：$summary")
+            speak(summary)
+            return true
+        } finally {
+            agentRunning = false
+        }
+    }
+
+    private fun List<SubTask>.mark(index: Int, status: String, note: String): List<SubTask> =
+        toMutableList().also { it[index] = it[index].copy(status = status, note = note) }
+
+    /** 一个子目标：先规则（毫秒级），规则不认才叫模型跑有限轮 */
+    private suspend fun runSubtask(goal: String): SubtaskResult {
+        when (val parsed = intentParser.parse(goal)) {
+            is ParseResult.Success -> {
+                val action = parsed.action
+                val target = if (action is Action.Confirm) unwrapConfirm(action) else action
+                if (action is Action.Confirm && !awaitConfirmation(action.question, target)) {
+                    return SubtaskResult.Fail("已取消")
+                }
+                val result = executor.execute(target)
+                ServiceLocator.logRepository.add(
+                    LogStage.EXECUTE,
+                    "${target.describe()} → ${result.message}",
+                    ok = result.ok
+                )
+                return if (result.ok) SubtaskResult.Ok(result.message) else SubtaskResult.Fail(result.message)
+            }
+
+            is ParseResult.Rejected -> Unit
+        }
+
+        val agent = TaskAgent(
+            gateway = ServiceLocator.llmGateway,
+            executor = executor,
+            snapshot = { executor.snapshotForAgent() },
+            onStep = { line ->
+                ServiceLocator.logRepository.add(LogStage.EXECUTE, line)
+                AssistantStateBus.update { it.copy(statusText = line) }
+                updateNotification(line)
+            }
+        )
+
+        return when (val outcome = agent.run(goal) { action, question ->
+            awaitConfirmation(question, action)
+        }) {
+            is TaskAgent.Outcome.Completed -> SubtaskResult.Ok(outcome.summary)
+            is TaskAgent.Outcome.NeedsUserInput -> SubtaskResult.Fail(outcome.question)
+            is TaskAgent.Outcome.Failed -> SubtaskResult.Fail(outcome.message)
+            TaskAgent.Outcome.NotATask -> SubtaskResult.NotATask
+        }
+    }
+
+    private sealed interface SubtaskResult {
+        data class Ok(val note: String) : SubtaskResult
+        data class Fail(val message: String) : SubtaskResult
+        data object NotATask : SubtaskResult
+    }
+
+    /**
+     * 多步执行里的危险动作：挂起等用户答复。
+     *
+     * 复用同一张悬浮确认卡——点按钮、口头说「确认/取消」都算数。
+     * 超时、被新指令顶掉、用户点悬浮球停止，一律按拒绝处理：
+     * 宁可任务中止，也绝不因为"等太久"就默认执行。
+     */
+    private suspend fun awaitConfirmation(question: String, action: Action): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        val shown = withContext(Dispatchers.Main) {
+            confirmDialog.show(question, action.describe()) { decision ->
+                deferred.complete(decision == ConfirmDialogController.Decision.CONFIRMED)
+            }
+        }
+        if (!shown) {
+            ServiceLocator.logRepository.add(
+                LogStage.CONFIRM,
+                "缺少悬浮窗权限，危险步骤已中止：$question",
+                ok = false
+            )
+            return false
+        }
+
+        ServiceLocator.logRepository.add(LogStage.CONFIRM, "等待确认：$question", ok = false)
+        AssistantStateBus.update { it.copy(statusText = "等待确认：$question") }
+        speak("$question 说确认，或者说取消")
+        return deferred.await()
     }
 
     // ---------------- 确认弹窗（模块 7） ----------------
@@ -813,6 +1075,9 @@ class AssistantService : Service() {
 
         /** 播报结束后等多久再开麦（喇叭余音） */
         private const val ECHO_TAIL_DELAY_MS = 500L
+
+        /** 整句等于这些词才算"继续上次任务" */
+        private val RESUME_WORDS = setOf("继续", "接着做", "继续做", "继续吧", "接着")
 
         /** 卡片可见时，整句等于这些词才算作答，避免误伤正常指令 */
         private val CONFIRM_WORDS = setOf("确认", "确定", "执行", "好的", "好", "可以", "是", "对")

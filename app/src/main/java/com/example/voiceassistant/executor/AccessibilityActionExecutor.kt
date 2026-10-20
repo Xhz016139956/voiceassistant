@@ -526,6 +526,61 @@ class AccessibilityActionExecutor(
         }
     }
 
+    // ---------------- 屏幕快照（多步执行用） ----------------
+
+    /**
+     * 给多步 agent 看的"当前屏幕"，一句话一句话拼成模型能读的纯文本。
+     *
+     * 关键约束：**可点击元素的序号必须与 [clickIndex] 完全同序**，
+     * 否则模型点第 3 个，实际点了别的，比报错更糟。两处都用
+     * `collectNodes(root).filter { isClickable && isVisibleToUser }`，顺序一致。
+     *
+     * 隐私：只给可见文字，不给包内结构、不给账号类长串；总长度封顶。
+     */
+    fun snapshotForAgent(): String {
+        val root = runCatching { rootNode() }.getOrNull() ?: return ""
+        val nodes = runCatching { collectNodes(root) }.getOrNull().orEmpty()
+        if (nodes.isEmpty()) return ""
+
+        val builder = StringBuilder(1024)
+
+        val packageName = runCatching { root.packageName?.toString().orEmpty() }.getOrDefault("")
+        if (packageName.isNotBlank()) {
+            builder.append("前台应用：").append(packageName).append('\n')
+        }
+
+        // 文字：去掉空串和重复项，太长就截断（模型不需要整页文案）
+        val texts = LinkedHashSet<String>()
+        for (node in nodes) {
+            if (!node.isVisibleToUser) continue
+            node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { texts.add(it.take(40)) }
+            node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { texts.add(it.take(40)) }
+            if (texts.size >= MAX_SNAPSHOT_TEXTS) break
+        }
+        builder.append("屏幕文字：")
+        builder.append(if (texts.isEmpty()) "（无）" else texts.joinToString(" | "))
+        builder.append('\n')
+
+        val clickables = nodes.filter { it.isClickable && it.isVisibleToUser }
+        builder.append("可点击元素（序号可直接用于 click_index）：\n")
+        if (clickables.isEmpty()) {
+            builder.append("（无）\n")
+        } else {
+            // 与 clickIndex 同序，所以只截取前 N 个，序号依然对应
+            clickables.take(MAX_SNAPSHOT_NODES).forEachIndexed { i, node ->
+                val label = (node.text?.toString()?.trim().orEmpty().ifEmpty {
+                    node.contentDescription?.toString()?.trim().orEmpty()
+                }).take(24)
+                builder.append(i + 1).append(". ")
+                if (node.isEditable) builder.append("[输入框] ")
+                builder.append(label.ifEmpty { "(无文字)" }).append('\n')
+            }
+        }
+
+        return builder.toString().take(MAX_SNAPSHOT_CHARS)
+    }
+
     // ---------------- 基础设施 ----------------
 
     private fun service(): AccessibilityService? = serviceProvider()
@@ -600,6 +655,11 @@ class AccessibilityActionExecutor(
         private const val MAX_TEXT_NODES = 200
         private const val MAX_SPEAK_LENGTH = 800
         private const val MAX_PARENT_DEPTH = 6
+
+        /** 屏幕快照的体量上限：模型上下文和手机算力都吃不下整页 */
+        private const val MAX_SNAPSHOT_TEXTS = 40
+        private const val MAX_SNAPSHOT_NODES = 30
+        private const val MAX_SNAPSHOT_CHARS = 1_600
 
         private const val NEED_SERVICE = "无障碍服务未连接，请在系统设置里开启"
     }
