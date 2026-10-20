@@ -45,6 +45,19 @@ sealed class Action {
     /** notify */
     data class Notify(val text: String, override val raw: String? = null) : Action()
 
+    /**
+     * send_message：一句话完成"打开 App → 搜联系人 → 输入 → 发送"。
+     *
+     * 为什么做成一个复合动作而不是让上层串五个动作：中间的节点名称、等待时长、
+     * 失败回滚都强依赖具体 App，放在执行器里才能统一处理；上层只管"发给谁、说什么"。
+     */
+    data class SendMessage(
+        val appName: String,
+        val contact: String,
+        val content: String,
+        override val raw: String? = null
+    ) : Action()
+
     /** confirm：危险动作必须由 UI 层二次确认后才转发 pending */
     data class Confirm(
         val question: String,
@@ -56,7 +69,8 @@ sealed class Action {
         /** 白名单动作名，JsonValidator 与系统提示词共用同一份 */
         val WHITELIST: Set<String> = setOf(
             "open_app", "back", "home", "click_text", "click_index",
-            "swipe", "input_text", "volume", "speak_screen", "notify", "confirm"
+            "swipe", "input_text", "volume", "speak_screen", "notify",
+            "send_message", "confirm"
         )
     }
 }

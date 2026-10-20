@@ -36,6 +36,13 @@ class SystemAsrEngine(private val context: Context) : AsrEngine {
     @Volatile
     private var released = false
 
+    /**
+     * 暂停态：识别结果已交出、上层正在思考或播报，期间不允许自动重启。
+     * 否则会把自己 TTS 的声音录回来，同一句指令执行两遍。
+     */
+    @Volatile
+    private var paused = false
+
     /** 连续"没听到内容"的轮数，用于退避与自动停止 */
     private var emptyRounds = 0
 
@@ -59,6 +66,8 @@ class SystemAsrEngine(private val context: Context) : AsrEngine {
             if (released || listening) return@runOnMain
             val engine = obtainRecognizer() ?: return@runOnMain
 
+            // 主动开麦即视为解除暂停（恢复监听走的是这条路）
+            paused = false
             listening = true
             mainHandler.removeCallbacks(timeoutTask)
             mainHandler.postDelayed(timeoutTask, TIMEOUT_MS)
@@ -70,6 +79,21 @@ class SystemAsrEngine(private val context: Context) : AsrEngine {
                     Log.w(TAG, "startListening failed", error)
                     listener?.onError("启动识别失败：${error.message.orEmpty()}")
                 }
+        }
+    }
+
+    /**
+     * 交出一句结果后调用：立刻关麦并禁止自动重启，等上层播报结束再 [startListening]。
+     * 不这么做，小米识别器会在 400ms 后重开麦，把 TTS 的尾音录成"又一次同样指令"。
+     */
+    fun pause() {
+        paused = true
+        mainHandler.removeCallbacks(timeoutTask)
+        runOnMain {
+            mainHandler.removeCallbacks(timeoutTask)
+            if (!listening) return@runOnMain
+            listening = false
+            runCatching { recognizer?.cancel() }
         }
     }
 
@@ -220,7 +244,7 @@ class SystemAsrEngine(private val context: Context) : AsrEngine {
 
     private fun scheduleRestart(delayMs: Long = RESTART_DELAY_MS) {
         mainHandler.postDelayed({
-            if (continuous && !released && !listening) startListening()
+            if (continuous && !released && !paused && !listening) startListening()
         }, delayMs)
     }
 

@@ -39,6 +39,7 @@ class LlmIntentParser(private val gateway: LlmGateway) {
             - {"action":"volume","command":"up|down|mute|unmute"}
             - {"action":"speak_screen"}
             - {"action":"notify","text":"晚上八点开会"}
+            - {"action":"send_message","app_name":"微信","contact":"老王","content":"晚上一起吃饭"}
 
             规则：
             1. 只能输出上面列出的动作，禁止自创动作名。
@@ -46,7 +47,12 @@ class LlmIntentParser(private val gateway: LlmGateway) {
             3. distance 范围 0.1-1.0，不确定就给 0.6。
             4. 涉及支付、转账、删除、发送、卸载、修改密码等敏感操作时，仍然照常输出对应动作，
                客户端会强制走二次确认，你不要自己做判断。
-            5. 完全无法判断时输出 {}。
+            5. 一句话里同时包含"打开某应用 + 给某人发消息/文字 + 内容"时，用 send_message，
+               不要拆成多个动作，也不要把内容写成 app 名。
+               例：说"给老王发微信说明天见" → {"action":"send_message","app_name":"微信","contact":"老王","content":"明天见"}
+               例：说"用QQ告诉张三我在路上" → {"action":"send_message","app_name":"QQ","contact":"张三","content":"我在路上"}
+            6. contact 只填人名/群名本身，不要带"给""发""说"等字。
+            7. 完全无法判断时输出 {}。
         """.trimIndent()
     }
 }

@@ -43,9 +43,14 @@
         </intent>
     </queries>
 
+    <!--
+      usesCleartextTraffic：局域网 Ollama 是 http://192.168.x.x:11434，Android 9+ 默认禁明文。
+      云端接口仍走 HTTPS，这里只是放行本地推理服务。
+    -->
     <application
         android:name=".VoiceAssistantApp"
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:icon="@drawable/ic_app_icon"
         android:label="@string/app_name"
         android:supportsRtl="true"

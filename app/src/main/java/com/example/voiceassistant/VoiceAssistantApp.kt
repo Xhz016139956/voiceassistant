@@ -10,6 +10,8 @@ class VoiceAssistantApp : Application() {
     override fun onCreate() {
         super.onCreate()
         ServiceLocator.init(this)
+        // 让 LLM 网关随时拿到最新配置（模型地址可能在设置页被改）
+        ServiceLocator.startSettingsObserver()
         autoEnableAccessibility()
     }
 

@@ -15,5 +15,6 @@ fun Action.describe(): String = when (this) {
     is Action.Volume -> "音量${command.label}"
     is Action.SpeakScreen -> "播报当前屏幕文字"
     is Action.Notify -> "提醒：$text"
+    is Action.SendMessage -> "在「$appName」里发给「$contact」：$content"
     is Action.Confirm -> "等待确认：$question"
 }

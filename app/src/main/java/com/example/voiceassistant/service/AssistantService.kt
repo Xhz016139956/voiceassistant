@@ -14,8 +14,11 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.example.voiceassistant.assistant.JarvisPrompts
+import com.example.voiceassistant.assistant.WakeWord
 import com.example.voiceassistant.asr.AsrEngine
 import com.example.voiceassistant.asr.AsrResultFilter
+import com.example.voiceassistant.asr.EchoGuard
 import com.example.voiceassistant.asr.SystemAsrEngine
 import com.example.voiceassistant.data.LogStage
 import com.example.voiceassistant.di.ServiceLocator
@@ -28,6 +31,7 @@ import com.example.voiceassistant.intent.describe
 import com.example.voiceassistant.overlay.ConfirmDialogController
 import com.example.voiceassistant.overlay.FloatingBallController
 import com.example.voiceassistant.state.AssistantStateBus
+import com.example.voiceassistant.tts.SystemTtsManager
 import com.example.voiceassistant.util.PermissionHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,8 +55,33 @@ class AssistantService : Service() {
     private lateinit var asrEngine: SystemAsrEngine
     private lateinit var intentParser: IntentParser
     private lateinit var executor: AccessibilityActionExecutor
+    private lateinit var tts: SystemTtsManager
     private val resultFilter = AsrResultFilter()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /** 对话态：唤醒后一直听，直到静默超时 */
+    private var chatMode = false
+
+    /** 语音唤醒开关（设置项） */
+    private var wakeEnabled = false
+
+    /** 用户手动点悬浮球开启的监听，停止时不能把唤醒模式一起关掉 */
+    private var manualListening = false
+
+    /** 前台服务就绪前不启动识别，避免踩 startForeground 的 5 秒红线 */
+    private var foregroundReady = false
+
+    private val chatTimeoutTask = Runnable { exitChatMode() }
+    private val wakeRearmTask = Runnable { startWakeListening() }
+
+    /** 播报结束后稍等再开麦，避开喇叭余音 */
+    private val resumeAfterSpeakTask = Runnable { resumeIfShould() }
+
+    /** 回声与重放过滤 */
+    private val echoGuard = EchoGuard()
+
+    /** 上层是否希望麦继续开着（暂停后据此决定要不要恢复），避免暂停变成"永久关麦" */
+    private var keepListening = false
 
     override fun onCreate() {
         super.onCreate()
@@ -65,6 +94,68 @@ class AssistantService : Service() {
         }
         intentParser = CompositeIntentParser()
         executor = AccessibilityActionExecutor(this) { ServiceLocator.accessibilityService }
+
+        tts = ServiceLocator.tts.apply {
+            onFinish = { onSpeakFinished() }
+            onAutoVoice = { engine, voiceKey ->
+                // 换了引擎没挑音色时自动选中的那个，落盘，避免每次重建又选一遍
+                scope.launch {
+                    val current = ServiceLocator.jarvisSettings
+                    ServiceLocator.settingsRepository.setTtsVoice(
+                        engine = engine,
+                        voice = voiceKey,
+                        pitch = current.ttsPitch,
+                        rate = current.ttsRate
+                    )
+                    ServiceLocator.logRepository.add(
+                        LogStage.SYSTEM,
+                        "已自动选用发音人：$voiceKey（引擎 $engine）"
+                    )
+                }
+            }
+            onFallback = { badEngine ->
+                // 选中的引擎根本不能播中文：把配置改回"系统默认"，别让界面继续骗人
+                scope.launch {
+                    val current = ServiceLocator.jarvisSettings
+                    ServiceLocator.settingsRepository.setTtsVoice(
+                        engine = "",
+                        voice = "",
+                        pitch = current.ttsPitch,
+                        rate = current.ttsRate
+                    )
+                    ServiceLocator.logRepository.add(
+                        LogStage.SYSTEM,
+                        "「$badEngine」不能播中文，已自动切回系统默认语音引擎",
+                        ok = false
+                    )
+                }
+            }
+        }
+
+        // 设置变化时同步：唤醒开关、静音、音色/语速
+        scope.launch {
+            ServiceLocator.settingsRepository.jarvis.collect { settings ->
+                val wakeChanged = settings.wakeWordEnabled != wakeEnabled
+                wakeEnabled = settings.wakeWordEnabled
+                tts.setMuted(settings.ttsMuted)
+                Log.i(
+                    TAG,
+                    "tts config: engine=${settings.ttsEngine.ifBlank { "default" }} " +
+                        "voice=${settings.ttsVoice.ifBlank { "default" }} " +
+                        "pitch=${settings.ttsPitch} rate=${settings.ttsRate}"
+                )
+                tts.applyConfig(
+                    enginePackage = settings.ttsEngine,
+                    voice = settings.ttsVoice,
+                    pitch = settings.ttsPitch,
+                    rate = settings.ttsRate
+                )
+                when {
+                    wakeEnabled && !chatMode && !tts.isSpeaking() -> startWakeListening()
+                    wakeChanged && !wakeEnabled && !chatMode && !manualListening -> stopListeningQuietly()
+                }
+            }
+        }
 
         val available = asrEngine.isRecognitionAvailable()
         Log.i(TAG, "asrAvailable=$available")
@@ -91,10 +182,13 @@ class AssistantService : Service() {
             return START_NOT_STICKY
         }
 
+        foregroundReady = true
+
         val shown = floatingBall.show { toggleListening() }
         AssistantStateBus.update {
             it.copy(overlayVisible = shown, statusText = if (shown) "待命中" else "悬浮球不可用")
         }
+        if (wakeEnabled) startWakeListening()
 
         updateNotification()
         ServiceLocator.logRepository.add(
@@ -110,7 +204,12 @@ class AssistantService : Service() {
         if (asrEngine.isListening()) {
             asrEngine.setContinuous(false)
             asrEngine.stopListening()
+            keepListening = false
             resultFilter.reset()
+            manualListening = false
+            chatMode = false
+            mainHandler.removeCallbacks(chatTimeoutTask)
+            tts.stop()
             // 停止监听等于「我不说了」，挂着的确认卡片一并作废
             confirmDialog.cancel()
             floatingBall.setListening(false)
@@ -133,6 +232,8 @@ class AssistantService : Service() {
             return
         }
 
+        manualListening = true
+        keepListening = true
         asrEngine.setContinuous(true)
         asrEngine.startListening()
         AssistantStateBus.update { it.copy(statusText = "正在启动识别…", partialText = "") }
@@ -143,10 +244,15 @@ class AssistantService : Service() {
 
         override fun onReady() {
             floatingBall.setListening(true)
-            AssistantStateBus.update {
-                it.copy(recording = true, level = 0f, partialText = "", statusText = "请说…")
+            val hint = when {
+                chatMode -> "我在听…"
+                wakeEnabled -> "说「${WakeWord.NAME}」唤醒我"
+                else -> "请说…"
             }
-            updateNotification("正在听… 说出你的指令")
+            AssistantStateBus.update {
+                it.copy(recording = true, level = 0f, partialText = "", statusText = hint)
+            }
+            updateNotification(hint)
         }
 
         override fun onPartial(text: String) {
@@ -163,6 +269,23 @@ class AssistantService : Service() {
                 return
             }
 
+            val verdict = echoGuard.check(
+                text,
+                SystemClock.elapsedRealtime(),
+                tts.isSpeaking()
+            )
+            if (verdict != EchoGuard.Verdict.ACCEPT) {
+                Log.i(TAG, "drop $verdict: $text")
+                floatingBall.setListening(false)
+                floatingBall.setLevel(0f)
+                AssistantStateBus.update { it.copy(recording = false, level = 0f, partialText = "") }
+                return
+            }
+
+            // 这句已经交给上层：先关麦并禁止自动重启，等播报结束再开，
+            // 免得 0.4s 后重开麦把自己的话听回来、同一指令执行两遍
+            asrEngine.pause()
+
             floatingBall.setListening(false)
             floatingBall.setLevel(0f)
             AssistantStateBus.update {
@@ -176,22 +299,248 @@ class AssistantService : Service() {
             }
             ServiceLocator.logRepository.add(LogStage.ASR, text)
             updateNotification("已识别：$text")
-            parseIntent(text)
+            dispatchRecognized(text)
         }
 
         override fun onError(message: String) {
             floatingBall.setListening(false)
             floatingBall.setLevel(0f)
-            AssistantStateBus.update {
-                it.copy(recording = false, level = 0f, statusText = message)
+
+            when {
+                chatMode -> AssistantStateBus.update {
+                    it.copy(recording = false, level = 0f, statusText = "我在听…")
+                }
+
+                wakeEnabled -> AssistantStateBus.update {
+                    it.copy(recording = false, level = 0f, statusText = "说「${WakeWord.NAME}」唤醒我")
+                }
+
+                else -> {
+                    AssistantStateBus.update {
+                        it.copy(recording = false, level = 0f, statusText = message)
+                    }
+                    ServiceLocator.logRepository.add(LogStage.ASR, message, ok = false)
+                    updateNotification()
+                }
             }
-            ServiceLocator.logRepository.add(LogStage.ASR, message, ok = false)
-            updateNotification()
+
+            // 常驻唤醒时识别器会因「连续没听到内容」自行停下，这里续上
+            if (wakeEnabled && !tts.isSpeaking() && PermissionHelper.isMicrophoneGranted(this@AssistantService)) {
+                mainHandler.removeCallbacks(wakeRearmTask)
+                mainHandler.postDelayed(wakeRearmTask, WAKE_REARM_DELAY_MS)
+            }
         }
 
         override fun onRmsChanged(level: Float) {
             floatingBall.setLevel(level)
         }
+    }
+
+    // ---------------- 贾维斯：唤醒 / 对话态 ----------------
+
+    /**
+     * 一句识别结果的分流：
+     *   确认弹窗在等答复 → 先当确认词处理
+     *   含唤醒词         → 进对话态（同一句里带指令就直接执行）
+     *   已在对话态       → 走聊天/指令
+     *   其余             → 单条指令（点悬浮球的用法）
+     */
+    private fun dispatchRecognized(text: String) {
+        if (handleSpokenConfirm(text)) return
+
+        if (WakeWord.matches(text)) {
+            val command = WakeWord.strip(text)
+            enterChatMode()
+            if (command.isNotEmpty()) {
+                handleChatTurn(command)
+            } else {
+                speak(pickWakeReply())
+            }
+            return
+        }
+
+        if (chatMode) {
+            handleChatTurn(text)
+            return
+        }
+
+        parseIntent(text)
+    }
+
+    private fun enterChatMode() {
+        if (!chatMode) {
+            chatMode = true
+            ServiceLocator.logRepository.add(LogStage.SYSTEM, "已唤醒：进入对话态")
+        }
+        armChatTimeout()
+    }
+
+    private fun exitChatMode() {
+        if (!chatMode) return
+        chatMode = false
+        mainHandler.removeCallbacks(chatTimeoutTask)
+        AssistantStateBus.update { it.copy(statusText = "待命中") }
+        ServiceLocator.logRepository.add(LogStage.SYSTEM, "对话超时，回到待命")
+        updateNotification()
+        if (wakeEnabled) startWakeListening()
+    }
+
+    private fun armChatTimeout() {
+        mainHandler.removeCallbacks(chatTimeoutTask)
+        mainHandler.postDelayed(chatTimeoutTask, CHAT_IDLE_TIMEOUT_MS)
+    }
+
+    private fun pickWakeReply(): String =
+        JarvisPrompts.WAKE_REPLIES.random()
+
+    /**
+     * 对话态下的一轮：先用本地规则（毫秒级、不花钱），规则不认的才问 LLM。
+     */
+    private fun handleChatTurn(text: String) {
+        armChatTimeout()
+        scope.launch {
+            val startedAt = SystemClock.elapsedRealtime()
+            val result = withContext(Dispatchers.IO) { intentParser.parse(text) }
+            val cost = SystemClock.elapsedRealtime() - startedAt
+
+            if (result is ParseResult.Success) {
+                val action = result.action
+                ServiceLocator.logRepository.add(
+                    LogStage.INTENT, action.describe(), input = text, costMillis = cost
+                )
+                if (action is Action.Confirm) {
+                    requestConfirmation(action)
+                } else {
+                    performAction(action)
+                }
+                return@launch
+            }
+
+            // 规则不认 → 聊天
+            AssistantStateBus.update { it.copy(statusText = "贾维斯在想…") }
+            updateNotification("正在思考…")
+
+            val settings = ServiceLocator.jarvisSettings
+            if (!settings.llmConfigured) {
+                // 说清楚到底缺哪一项，别只丢一句"未接"
+                val missing = buildList {
+                    if (settings.llmBaseUrl.isBlank()) add("模型地址")
+                    if (settings.llmModel.isBlank()) add("模型名")
+                }.joinToString("和")
+                ServiceLocator.logRepository.add(LogStage.LLM, "聊天大脑缺少：$missing", ok = false)
+                speak(JarvisPrompts.NOT_CONFIGURED)
+                return@launch
+            }
+
+            val answer = ServiceLocator.llmGateway.complete(JarvisPrompts.SYSTEM, text)
+            if (answer.isNullOrBlank()) {
+                // 失败时补一次探测，把"连不上"落到具体原因（拒绝连接/模型不存在/超时）
+                val probe = withContext(Dispatchers.IO) {
+                    ServiceLocator.llmProbe.probe(
+                        settings.llmBaseUrl, settings.llmApiKey, settings.llmModel
+                    )
+                }
+                val found = probe.suggestedBaseUrl
+                if (found != null) {
+                    // 原地址（多半是 adb 隧道）不通，但局域网里找到了电脑：换上并让用户重说一次
+                    ServiceLocator.settingsRepository.setLlm(
+                        baseUrl = found,
+                        apiKey = settings.llmApiKey,
+                        model = probe.suggestedModel ?: settings.llmModel
+                    )
+                    ServiceLocator.logRepository.add(
+                        LogStage.LLM,
+                        "原地址不通，已自动改用 $found。${probe.message}",
+                        input = text,
+                        ok = false
+                    )
+                    speak("刚才连不上，我换了个地址找到电脑了，再说一次")
+                    return@launch
+                }
+
+                ServiceLocator.logRepository.add(
+                    LogStage.LLM,
+                    "调用失败：${probe.message}",
+                    input = text,
+                    ok = false
+                )
+                speak(JarvisPrompts.LLM_FAILED)
+                return@launch
+            }
+
+            val cost2 = SystemClock.elapsedRealtime() - startedAt
+            ServiceLocator.logRepository.add(
+                LogStage.LLM, answer, input = text, costMillis = cost2
+            )
+            AssistantStateBus.update { it.copy(lastText = text, statusText = "贾维斯：$answer") }
+            speak(answer)
+        }
+    }
+
+    // ---------------- 播报 ----------------
+
+    /** 开口前必须停麦，否则会把自己的话再识别一遍 */
+    private fun speak(text: String) {
+        val content = text.trim()
+        if (content.isEmpty()) return
+
+        // 记下"我说过什么"，用于把随后录到的回声丢掉
+        echoGuard.onSpoken(content, SystemClock.elapsedRealtime())
+
+        // 不管当前是否在录音都要挡住自动重启：可能正有一发 0.4s 后的重启在排队
+        asrEngine.pause()
+        floatingBall.setListening(false)
+        floatingBall.setLevel(0f)
+
+        AssistantStateBus.update { it.copy(recording = false, level = 0f, statusText = content) }
+        updateNotification(content)
+        tts.speak(content)
+    }
+
+    private fun onSpeakFinished() {
+        // 播报占用的时间不该算进「对话静默」里，否则一句话长一点就被判超时
+        if (chatMode) armChatTimeout()
+        // 喇叭余音还在，等一小会儿再开麦，否则一开就录到自己的尾音
+        mainHandler.removeCallbacks(resumeAfterSpeakTask)
+        mainHandler.postDelayed(resumeAfterSpeakTask, ECHO_TAIL_DELAY_MS)
+    }
+
+    private fun resumeIfShould() {
+        val shouldResume = keepListening || chatMode || wakeEnabled ||
+            manualListening || confirmDialog.isShowing
+        if (shouldResume) resumeListening()
+    }
+
+    private fun resumeListening() {
+        if (asrEngine.isListening() || tts.isSpeaking()) return
+        if (!PermissionHelper.isMicrophoneGranted(this)) return
+        keepListening = true
+        asrEngine.setContinuous(true)
+        asrEngine.startListening()
+    }
+
+    private fun startWakeListening() {
+        if (!foregroundReady) return
+        if (!wakeEnabled || tts.isSpeaking()) return
+        if (!PermissionHelper.isMicrophoneGranted(this)) return
+        if (!asrEngine.isRecognitionAvailable()) return
+        if (asrEngine.isListening()) return
+
+        keepListening = true
+        asrEngine.setContinuous(true)
+        asrEngine.startListening()
+        AssistantStateBus.update { it.copy(statusText = "说「${WakeWord.NAME}」唤醒我") }
+    }
+
+    private fun stopListeningQuietly() {
+        if (!asrEngine.isListening()) return
+        keepListening = false
+        asrEngine.setContinuous(false)
+        asrEngine.stopListening()
+        floatingBall.setListening(false)
+        floatingBall.setLevel(0f)
+        AssistantStateBus.update { it.copy(recording = false, level = 0f, statusText = "待命中") }
+        updateNotification()
     }
 
     // ---------------- 意图解析与执行（模块 4-5-7） ----------------
@@ -240,6 +589,7 @@ class AssistantService : Service() {
                     )
                     AssistantStateBus.update { it.copy(statusText = "没听懂") }
                     toast("没听懂：${text}")
+                    resumeIfShould()
                 }
             }
         }
@@ -282,6 +632,8 @@ class AssistantService : Service() {
 
         AssistantStateBus.update { it.copy(statusText = "等待确认：${action.question}") }
         updateNotification(action.question)
+        // 念出来用户才知道有这么个卡片；播报结束后会自动恢复识别，方便直接说「确认」
+        speak("${action.question} 说确认，或者说取消")
     }
 
     private fun onConfirmDecision(target: Action, decision: ConfirmDialogController.Decision) {
@@ -361,8 +713,16 @@ class AssistantService : Service() {
         )
         AssistantStateBus.update { it.copy(statusText = execResult.message) }
         updateNotification(execResult.message)
-        // 用户可能根本不在这个 App 里，光靠首页卡片和静音通知等于「没反应」
-        toast(execResult.message)
+
+        // 用户可能根本不在这个 App 里，光靠首页卡片和静音通知等于「没反应」。
+        // TTS 可用就念出来，不可用（或静音）退回 Toast。
+        if (tts.isReady() && !ServiceLocator.jarvisSettings.ttsMuted) {
+            speak(execResult.message)
+        } else {
+            toast(execResult.message)
+            // 没播报就不会有 onSpeakFinished，这里得自己把麦接回来
+            resumeIfShould()
+        }
     }
 
     private fun toast(message: String) {
@@ -405,6 +765,14 @@ class AssistantService : Service() {
     }
 
     private fun stopSelfSafely() {
+        foregroundReady = false
+        chatMode = false
+        mainHandler.removeCallbacks(chatTimeoutTask)
+        mainHandler.removeCallbacks(wakeRearmTask)
+        mainHandler.removeCallbacks(resumeAfterSpeakTask)
+        keepListening = false
+        manualListening = false
+        runCatching { tts.stop() }
         runCatching { confirmDialog.cancel() }
         runCatching { asrEngine.release() }
         runCatching { floatingBall.hide() }
@@ -419,8 +787,11 @@ class AssistantService : Service() {
     override fun onDestroy() {
         scope.cancel()
         mainHandler.removeCallbacksAndMessages(null)
+        chatMode = false
         // 进程层面收尾：静默摘掉卡片，不再回调（scope 已 cancel）
         runCatching { confirmDialog.release() }
+        // TTS 是应用级共享实例，这里只停播报，不 release（设置页还要用）
+        runCatching { tts.stop() }
         runCatching { asrEngine.release() }
         runCatching { floatingBall.hide() }
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -433,6 +804,15 @@ class AssistantService : Service() {
     companion object {
         private const val TAG = "VoiceService"
         const val ACTION_STOP = "com.example.voiceassistant.action.STOP"
+
+        /** 对话态静默多久自动退出 */
+        private const val CHAT_IDLE_TIMEOUT_MS = 15_000L
+
+        /** 唤醒监听被识别器自行停掉后，多久续上 */
+        private const val WAKE_REARM_DELAY_MS = 1_200L
+
+        /** 播报结束后等多久再开麦（喇叭余音） */
+        private const val ECHO_TAIL_DELAY_MS = 500L
 
         /** 卡片可见时，整句等于这些词才算作答，避免误伤正常指令 */
         private val CONFIRM_WORDS = setOf("确认", "确定", "执行", "好的", "好", "可以", "是", "对")

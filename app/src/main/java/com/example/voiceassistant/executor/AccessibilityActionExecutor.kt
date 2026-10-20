@@ -16,6 +16,7 @@ import com.example.voiceassistant.intent.SwipeDirection
 import com.example.voiceassistant.intent.VolumeCommand
 import com.example.voiceassistant.intent.describe
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -36,8 +37,12 @@ class AccessibilityActionExecutor(
 ) : ActionExecutor {
 
     override suspend fun execute(action: Action): ExecResult {
-        // 打开应用要查包管理器，耗时比其它动作高一个数量级，单独给更宽的超时
-        val timeout = if (action is Action.OpenApp) OPEN_APP_TIMEOUT_MS else TIMEOUT_MS
+        // 打开应用要查包管理器；发消息要走完整个界面流程，两者都比单步动作慢得多
+        val timeout = when (action) {
+            is Action.OpenApp -> OPEN_APP_TIMEOUT_MS
+            is Action.SendMessage -> SEND_MESSAGE_TIMEOUT_MS
+            else -> TIMEOUT_MS
+        }
         val startedAt = SystemClock.elapsedRealtime()
 
         val result = withTimeoutOrNull(timeout) {
@@ -64,6 +69,7 @@ class AccessibilityActionExecutor(
         is Action.Volume -> volume(action.command)
         is Action.SpeakScreen -> speakScreen()
         is Action.Notify -> ExecResult.failure("提醒功能将在后续模块接入")
+        is Action.SendMessage -> sendMessage(action)
         is Action.Confirm -> ExecResult.failure("确认动作应由上层处理，不能直接执行")
     }
 
@@ -75,12 +81,43 @@ class AccessibilityActionExecutor(
         if (target.isEmpty()) return@withContext ExecResult.failure("应用名为空")
 
         val startedAt = SystemClock.elapsedRealtime()
+        val match = findApp(target)
+            ?: return@withContext ExecResult.failure("没有找到应用「$target」")
 
-        // 只枚举带桌面入口的应用（几十个）。之前用 getInstalledApplications 逐个查 label，
-        // 这台机器上有 150+ 应用，光查询就能吃掉 4 秒超时，用户看到的就是「说了没反应」。
+        val launchIntent = pm.getLaunchIntentForPackage(match.packageName)
+            ?: return@withContext ExecResult.failure("「${match.label}」没有可启动的界面")
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        Log.i(
+            TAG,
+            "openApp target=$target -> ${match.label}(${match.packageName}), " +
+                "lookup ${SystemClock.elapsedRealtime() - startedAt}ms"
+        )
+
+        runCatching { context.startActivity(launchIntent) }
+            .fold(
+                onSuccess = { ExecResult.success("已打开「${match.label}」") },
+                onFailure = {
+                    Log.e(TAG, "startActivity failed: ${match.packageName}", it)
+                    ExecResult.failure("打开「${match.label}」失败：${it.message.orEmpty()}")
+                }
+            )
+    }
+
+    private fun launcherIntent(): Intent =
+        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+
+    private data class AppMatch(val label: String, val packageName: String)
+
+    /**
+     * 按名字找已安装应用（只枚举桌面入口，几十个，避开 150+ 应用全量查 label 的 4 秒超时）。
+     * 匹配优先级：完全相同 → 忽略大小写 → 前缀 → 包含（取最短标签，避免「微信」命中「微信读书」）。
+     */
+    private fun findApp(target: String): AppMatch? {
+        val pm = context.packageManager
         val candidates = runCatching {
             pm.queryIntentActivities(launcherIntent(), 0)
-        }.getOrElse { return@withContext ExecResult.failure("读取应用列表失败") }
+        }.getOrNull() ?: return null
 
         val labelToPackage = LinkedHashMap<String, String>(candidates.size)
         val seenPackages = HashSet<String>(candidates.size)
@@ -92,39 +129,177 @@ class AccessibilityActionExecutor(
             labelToPackage.putIfAbsent(label, pkg)
         }
 
-        // 匹配优先级：完全相同 → 忽略大小写 → 前缀 → 包含（取最短的标签，避免「微信」命中「微信读书」）
         val matchedLabel = labelToPackage.keys.firstOrNull { it == target }
             ?: labelToPackage.keys.firstOrNull { it.equals(target, ignoreCase = true) }
             ?: labelToPackage.keys.firstOrNull { it.startsWith(target) }
             ?: labelToPackage.keys.filter { it.contains(target) }.minByOrNull { it.length }
+            ?: return null
 
-        if (matchedLabel == null) {
-            Log.w(TAG, "openApp miss target=$target, ${labelToPackage.size} launchers in ${SystemClock.elapsedRealtime() - startedAt}ms")
-            return@withContext ExecResult.failure("没有找到应用「$target」")
-        }
-
-        val packageName = labelToPackage.getValue(matchedLabel)
-        val launchIntent = pm.getLaunchIntentForPackage(packageName)
-            ?: return@withContext ExecResult.failure("「$matchedLabel」没有可启动的界面")
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-
-        Log.i(
-            TAG,
-            "openApp target=$target -> $matchedLabel($packageName), lookup ${SystemClock.elapsedRealtime() - startedAt}ms"
-        )
-
-        runCatching { context.startActivity(launchIntent) }
-            .fold(
-                onSuccess = { ExecResult.success("已打开「$matchedLabel」") },
-                onFailure = {
-                    Log.e(TAG, "startActivity failed: $packageName", it)
-                    ExecResult.failure("打开「$matchedLabel」失败：${it.message.orEmpty()}")
-                }
-            )
+        return AppMatch(matchedLabel, labelToPackage.getValue(matchedLabel))
     }
 
-    private fun launcherIntent(): Intent =
-        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    // ---------------- 发消息（复合动作） ----------------
+
+    /**
+     * 打开 App → 搜索联系人 → 进会话 → 输入 → 发送。
+     *
+     * 每一步失败都返回具体原因（而不是笼统的"失败"），因为这类自动化最怕的就是
+     * "说了没反应"却不知道卡在哪一步；日志里也会记每一步耗时。
+     */
+    private suspend fun sendMessage(action: Action.SendMessage): ExecResult {
+        val contact = action.contact.trim()
+        val content = action.content.trim().take(500)
+        if (contact.isEmpty()) return ExecResult.failure("没听清要发给谁")
+        if (content.isEmpty()) return ExecResult.failure("没说发什么内容")
+
+        val opened = openApp(action.appName)
+        if (!opened.ok) return opened
+
+        val match = withContext(Dispatchers.IO) { findApp(action.appName) }
+        if (match != null && !awaitForeground(match.packageName, FOREGROUND_WAIT_MS)) {
+            return ExecResult.failure("「${action.appName}」没有切到前台")
+        }
+        delay(STEP_DELAY_MS)
+
+        // 1) 搜索框：优先找"搜索"入口（内容描述/文字）并点开
+        if (!openSearchEntry()) {
+            return ExecResult.failure("没找到「${action.appName}」的搜索入口")
+        }
+        delay(STEP_DELAY_MS)
+
+        val searchBox = findFocusedEditable() ?: findEditable(preferBottom = false)
+            ?: return ExecResult.failure("搜索框没有出现")
+        if (!setText(searchBox, contact)) return ExecResult.failure("联系人名字输不进去")
+        delay(SEARCH_DELAY_MS)
+
+        // 2) 点搜索结果里最匹配的那一项
+        val hit = findTextNode(contact) ?: return ExecResult.failure("搜索结果里没有「$contact」")
+        val clicked = clickNodeOrAncestor(hit, contact)
+        if (!clicked.ok) return clicked
+        delay(CHAT_DELAY_MS)
+
+        // 3) 聊天输入框（屏幕下半部分那个）
+        val input = findEditable(preferBottom = true)
+            ?: return ExecResult.failure("没找到聊天输入框")
+        clickNode(input)
+        delay(300)
+        if (!setText(input, content)) return ExecResult.failure("消息内容输入失败")
+        delay(STEP_DELAY_MS)
+
+        // 4) 发送
+        val send = findSendButton() ?: return ExecResult.failure("没找到发送按钮")
+        val sent = clickNodeOrAncestor(send, "发送")
+        if (!sent.ok) return sent
+        delay(300)
+
+        Log.i(TAG, "sendMessage ok: app=${action.appName} contact=$contact len=${content.length}")
+        return ExecResult.success("已给「$contact」发送：$content")
+    }
+
+    /** 轮询当前前台包名，等目标 App 真的到前台（冷启动可能要几秒） */
+    private suspend fun awaitForeground(packageName: String, timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val pkg = runCatching { rootNode()?.packageName?.toString() }.getOrNull()
+            if (pkg == packageName) return true
+            delay(200)
+        }
+        return false
+    }
+
+    /** 点开搜索：找「搜索」文字/描述，或者屏幕上第一个可编辑框 */
+    private suspend fun openSearchEntry(): Boolean {
+        val root = rootNode() ?: return false
+        val nodes = collectNodes(root)
+
+        val searchNode = nodes.firstOrNull {
+            val desc = it.contentDescription?.toString().orEmpty()
+            val text = it.text?.toString().orEmpty()
+            it.isVisibleToUser && (desc.contains("搜索") || text.contains("搜索"))
+        }
+        if (searchNode != null) {
+            clickNodeOrAncestor(searchNode, "搜索")
+            return true
+        }
+
+        val editable = findEditable(preferBottom = false)
+        if (editable != null) {
+            clickNode(editable)
+            return true
+        }
+        return false
+    }
+
+    private fun findFocusedEditable(): AccessibilityNodeInfo? {
+        val root = rootNode() ?: return null
+        return runCatching { root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }.getOrNull()
+    }
+
+    /** 可编辑框；preferBottom 选屏幕最下方那个（聊天输入框），否则选最上方（搜索框） */
+    private fun findEditable(preferBottom: Boolean): AccessibilityNodeInfo? {
+        val root = rootNode() ?: return null
+        val metrics = context.resources.displayMetrics
+        val editable = collectNodes(root).filter { it.isEditable && it.isVisibleToUser }
+        if (editable.isEmpty()) return null
+
+        val withBounds = editable.mapNotNull { node ->
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            if (rect.width() <= 0 || rect.height() <= 0) null else node to rect
+        }
+        if (withBounds.isEmpty()) return null
+
+        return if (preferBottom) {
+            // 下半屏优先，且取最靠下的
+            withBounds.filter { it.second.top > metrics.heightPixels / 2 }
+                .maxByOrNull { it.second.top }?.first
+                ?: withBounds.maxByOrNull { it.second.top }?.first
+        } else {
+            withBounds.minByOrNull { it.second.top }?.first
+        }
+    }
+
+    private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        val ok = runCatching { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) }
+            .getOrDefault(false)
+        if (ok) return true
+        // 少数输入框不认 SET_TEXT，用粘贴兜底
+        return runCatching {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                as? android.content.ClipboardManager
+            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("msg", text))
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS) &&
+                node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        }.getOrDefault(false)
+    }
+
+    private suspend fun clickNode(node: AccessibilityNodeInfo): Boolean {
+        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (rect.width() <= 0 || rect.height() <= 0) return false
+        return dispatchTap(rect.exactCenterX(), rect.exactCenterY())
+    }
+
+    /** 找联系人/结果项：优先精确同名，其次包含；排除搜索框本身 */
+    private fun findTextNode(keyword: String): AccessibilityNodeInfo? {
+        val root = rootNode() ?: return null
+        val nodes = collectNodes(root).filter { it.isVisibleToUser && !it.isEditable }
+        return nodes.firstOrNull { it.text?.toString()?.trim() == keyword }
+            ?: nodes.firstOrNull { it.text?.toString()?.contains(keyword) == true }
+            ?: nodes.firstOrNull { it.contentDescription?.toString()?.contains(keyword) == true }
+    }
+
+    private fun findSendButton(): AccessibilityNodeInfo? {
+        val root = rootNode() ?: return null
+        val nodes = collectNodes(root).filter { it.isVisibleToUser }
+        return nodes.firstOrNull { it.text?.toString()?.trim() == "发送" }
+            ?: nodes.firstOrNull { it.contentDescription?.toString()?.trim() == "发送" }
+            ?: nodes.firstOrNull { it.text?.toString()?.contains("发送") == true }
+    }
 
     // ---------------- 全局动作 ----------------
 
@@ -411,6 +586,13 @@ class AccessibilityActionExecutor(
         private const val TAG = "VoiceExec"
         private const val TIMEOUT_MS = 4_000L
         private const val OPEN_APP_TIMEOUT_MS = 10_000L
+
+        /** 发消息要经过"启动→搜索→进会话→输入→发送"，给足 30 秒（微信冷启动很慢） */
+        private const val SEND_MESSAGE_TIMEOUT_MS = 30_000L
+        private const val FOREGROUND_WAIT_MS = 10_000L
+        private const val STEP_DELAY_MS = 500L
+        private const val SEARCH_DELAY_MS = 1_200L
+        private const val CHAT_DELAY_MS = 1_200L
         private const val TAP_DURATION_MS = 60L
         private const val SWIPE_DURATION_MS = 300L
         private const val MAX_TREE_DEPTH = 40

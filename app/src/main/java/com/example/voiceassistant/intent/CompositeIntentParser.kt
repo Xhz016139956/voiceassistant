@@ -22,17 +22,19 @@ class CompositeIntentParser(
             llmParser.parse(trimmed)
         }
 
-        if (result is ParseResult.Success &&
+        // 发消息一律二次确认：发出去就撤不回，而且这是最容易因为听错人/听错字翻车的动作
+        val needsConfirm = result is ParseResult.Success &&
             result.action !is Action.Confirm &&
-            DangerRules.isDangerous(trimmed)
-        ) {
-            return ParseResult.Success(
-                Action.Confirm(
-                    question = "「$trimmed」涉及敏感操作，确定执行吗？",
-                    pending = result.action,
-                    raw = trimmed
-                )
-            )
+            (DangerRules.isDangerous(trimmed) || result.action is Action.SendMessage)
+
+        if (needsConfirm) {
+            val action = (result as ParseResult.Success).action
+            val question = if (action is Action.SendMessage) {
+                "要发给「${action.contact}」：${action.content}。确定发送吗？"
+            } else {
+                "「$trimmed」涉及敏感操作，确定执行吗？"
+            }
+            return ParseResult.Success(Action.Confirm(question, action, trimmed))
         }
 
         return result

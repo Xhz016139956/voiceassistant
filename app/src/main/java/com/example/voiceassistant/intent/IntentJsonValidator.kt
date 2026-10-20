@@ -112,6 +112,19 @@ object IntentJsonValidator {
                 }
             }
 
+            "send_message" -> {
+                val appName = obj["app_name"].asString()?.trim()
+                val contact = obj["contact"].asString()?.trim()
+                val content = obj["content"].asString()?.trim()
+                when {
+                    appName.isNullOrBlank() -> ParseResult.Rejected("send_message 缺少 app_name")
+                    contact.isNullOrBlank() -> ParseResult.Rejected("send_message 缺少 contact")
+                    content.isNullOrBlank() -> ParseResult.Rejected("send_message 缺少 content")
+                    content.length > MAX_TEXT_LENGTH -> ParseResult.Rejected("send_message 内容过长")
+                    else -> ParseResult.Success(Action.SendMessage(appName, contact, content))
+                }
+            }
+
             "confirm" -> {
                 if (depth >= MAX_DEPTH) {
                     return ParseResult.Rejected("confirm 嵌套过深")
