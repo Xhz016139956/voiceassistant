@@ -63,6 +63,8 @@ class TaskAgent(
     suspend fun run(
         task: String,
         maxSteps: Int = DEFAULT_MAX_STEPS,
+        context: String = "",
+        shouldStop: () -> Boolean = { false },
         confirm: suspend (Action, String) -> Boolean
     ): Outcome {
         val steps = ArrayList<Executed>()
@@ -72,8 +74,11 @@ class TaskAgent(
         var index = 0
 
         while (index < maxSteps) {
+            // 用户随时可以喊停：人在做事时也能被打断
+            if (shouldStop()) return Outcome.Failed("已停下", steps)
+
             val screen = snapshot()
-            val raw = gateway.complete(SYSTEM_PROMPT, buildUserPrompt(task, steps, screen))
+            val raw = gateway.complete(SYSTEM_PROMPT, buildUserPrompt(task, steps, screen, context))
                 ?: return Outcome.Failed("模型没有响应", steps)
 
             val step = StepParser.parse(raw)
@@ -161,8 +166,16 @@ class TaskAgent(
         Regex("(?m)^(\\d+)\\. ").findAll(snapshot)
             .maxOfOrNull { it.groupValues[1].toIntOrNull() ?: 0 } ?: 0
 
-    private fun buildUserPrompt(task: String, steps: List<Executed>, screen: String): String =
+    private fun buildUserPrompt(
+        task: String,
+        steps: List<Executed>,
+        screen: String,
+        context: String
+    ): String =
         buildString {
+            if (context.isNotBlank()) {
+                append(context.trim()).append("\n\n")
+            }
             append("任务：").append(task).append("\n\n")
 
             if (steps.isEmpty()) {

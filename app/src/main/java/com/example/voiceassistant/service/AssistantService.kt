@@ -14,6 +14,7 @@ import android.util.Log
 import android.widget.Toast
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import com.example.voiceassistant.agent.ConversationMemory
 import com.example.voiceassistant.agent.SubTask
 import com.example.voiceassistant.agent.TaskAgent
 import com.example.voiceassistant.agent.TaskPlanner
@@ -96,12 +97,20 @@ class AssistantService : Service() {
     /** 任务状态落盘：进程被杀后还能知道上次做到第几步 */
     private lateinit var taskStore: TaskStore
 
+    /** 短期对话记忆：让「打开它」「刚才那个」能接上上文 */
+    private lateinit var memory: ConversationMemory
+
+    /** 用户喊停时置位，任务在下一步之前收手 */
+    @Volatile
+    private var agentCancel = false
+
     override fun onCreate() {
         super.onCreate()
         NotificationHelper.ensureChannel(this)
         floatingBall = FloatingBallController(this)
         confirmDialog = ConfirmDialogController(this)
         taskStore = TaskStore(this)
+        memory = ConversationMemory(this)
 
         // 上次任务没跑完（多半是进程被系统杀了）：这里只提示，不擅自重跑——
         // 手机可能已经换了界面，突然自己动起来比不做更吓人
@@ -372,10 +381,14 @@ class AssistantService : Service() {
      */
     private fun dispatchRecognized(text: String) {
         if (handleSpokenConfirm(text)) return
+        if (tryStopTask(text)) return
         if (tryResumeTask(text)) return
 
-        if (WakeWord.matches(text)) {
-            val command = WakeWord.strip(text)
+        // 指代消解：「打开它」→「打开微信」。人说话就这样省略，先补全再往下走
+        val resolved = memory.resolveReferences(text)
+
+        if (WakeWord.matches(resolved)) {
+            val command = WakeWord.strip(resolved)
             enterChatMode()
             if (command.isNotEmpty()) {
                 handleChatTurn(command)
@@ -386,11 +399,27 @@ class AssistantService : Service() {
         }
 
         if (chatMode) {
-            handleChatTurn(text)
+            handleChatTurn(resolved)
             return
         }
 
-        parseIntent(text)
+        parseIntent(resolved)
+    }
+
+    /**
+     * 任务跑到一半用户喊停：立刻收手。
+     *
+     * 人做事被打断会停，助手也一样——而且这比"等它做错再重来"便宜得多。
+     */
+    private fun tryStopTask(text: String): Boolean {
+        if (!agentRunning) return false
+        val normalized = text.trim().trim('。', '，', ',', '！', '!', '.', ' ')
+        if (normalized !in STOP_WORDS) return false
+
+        agentCancel = true
+        runCatching { confirmDialog.cancel() }
+        ServiceLocator.logRepository.add(LogStage.SYSTEM, "收到「$normalized」，正在停下")
+        return true
     }
 
     private fun enterChatMode() {
@@ -473,7 +502,10 @@ class AssistantService : Service() {
                 return@launch
             }
 
-            val answer = ServiceLocator.llmGateway.complete(JarvisPrompts.SYSTEM, text)
+            // 带上最近几轮对话：人回答"那它的价格呢"靠的是上文，不是这一句
+            val context = memory.promptContext()
+            val chatInput = if (context.isBlank()) text else "$context\n用户：$text"
+            val answer = ServiceLocator.llmGateway.complete(JarvisPrompts.SYSTEM, chatInput)
             if (answer.isNullOrBlank()) {
                 // 失败时补一次探测，把"连不上"落到具体原因（拒绝连接/模型不存在/超时）
                 val probe = withContext(Dispatchers.IO) {
@@ -513,6 +545,8 @@ class AssistantService : Service() {
             ServiceLocator.logRepository.add(
                 LogStage.LLM, answer, input = text, costMillis = cost2
             )
+            // 聊天也记进上文：下一句说「那它的价格呢」才接得住
+            memory.record(text, answer)
             AssistantStateBus.update { it.copy(lastText = text, statusText = "贾维斯：$answer") }
             speak(answer)
         }
@@ -748,13 +782,26 @@ class AssistantService : Service() {
     /** 按任务状态往下跑；进程被杀后凭落盘状态可以接着来 */
     private suspend fun runPlan(state: TaskState): Boolean {
         agentRunning = true
+        agentCancel = false
         var current = state
         try {
             taskStore.save(current)
             val total = current.subtasks.size
             var index = current.cursor
 
+            // 先复述一遍再动手：人接到多步指令会先"嗯，我来…"，不是闷头点
+            if (total > 1 && index == 0) {
+                val preview = current.subtasks.joinToString("，") { it.goal }.take(40)
+                speak("好，$preview")
+            }
+
             while (index < total) {
+                if (agentCancel) {
+                    speak("好，停下了")
+                    ServiceLocator.logRepository.add(LogStage.SYSTEM, "任务已按用户要求停止")
+                    return true
+                }
+
                 val goal = current.subtasks[index].goal
                 val label = "第${index + 1}/$total 步：$goal"
                 AssistantStateBus.update { it.copy(statusText = label) }
@@ -779,6 +826,8 @@ class AssistantService : Service() {
                         ServiceLocator.logRepository.add(
                             LogStage.EXECUTE, "第${index + 1}步完成：${result.note}"
                         )
+                        // 边做边说：让人知道走到哪了，而不是等最后一句总结
+                        if (total > 1) narrate(result.note)
                         index++
                     }
 
@@ -797,6 +846,7 @@ class AssistantService : Service() {
                         )
                         // 不做静默跳过：后面几步往往依赖这一步的结果
                         speak("第${index + 1}步没做成：${result.message}")
+                        memory.record(state.utterance, "第${index + 1}步失败：${result.message}")
                         return true
                     }
 
@@ -818,10 +868,30 @@ class AssistantService : Service() {
             }
             ServiceLocator.logRepository.add(LogStage.EXECUTE, "任务完成：$summary")
             speak(summary)
+            memory.record(state.utterance, summary)
             return true
         } finally {
             agentRunning = false
+            agentCancel = false
         }
+    }
+
+    /**
+     * 把执行器的机械回执翻译成人话，边说边做用。
+     * 「已打开「DeepSeek」」→「打开了」，短、不啰嗦，念出来才像人在干活。
+     */
+    private fun narrate(note: String) {
+        if (!tts.isReady() || ServiceLocator.jarvisSettings.ttsMuted) return
+        val line = when {
+            note.startsWith("已打开") -> "打开了"
+            note.startsWith("已输入") -> "打好了"
+            note.startsWith("已点击「发送") -> "发出去了"
+            note.startsWith("已点击") -> "点好了"
+            note.startsWith("已向") -> "翻过去了"
+            note.contains("超时") -> "这一步卡住了"
+            else -> note.take(12)
+        }
+        speak(line)
     }
 
     private fun List<SubTask>.mark(index: Int, status: String, note: String): List<SubTask> =
@@ -842,6 +912,18 @@ class AssistantService : Service() {
                     "${target.describe()} → ${result.message}",
                     ok = result.ok
                 )
+                // 记住"刚才是哪个 App / 哪个人"，下次说「打开它」「发给他」才接得上
+                if (result.ok) {
+                    when (target) {
+                        is Action.OpenApp -> memory.noteApp(target.appName)
+                        is Action.SendMessage -> {
+                            memory.noteApp(target.appName)
+                            memory.noteContact(target.contact)
+                        }
+
+                        else -> Unit
+                    }
+                }
                 return if (result.ok) SubtaskResult.Ok(result.message) else SubtaskResult.Fail(result.message)
             }
 
@@ -864,7 +946,11 @@ class AssistantService : Service() {
             }
         )
 
-        return when (val outcome = agent.run(goal) { action, question ->
+        return when (val outcome = agent.run(
+            task = goal,
+            context = memory.promptContext(),
+            shouldStop = { agentCancel }
+        ) { action, question ->
             awaitConfirmation(question, action)
         }) {
             is TaskAgent.Outcome.Completed -> SubtaskResult.Ok(outcome.summary)
@@ -1130,6 +1216,12 @@ class AssistantService : Service() {
 
         /** 整句等于这些词才算"继续上次任务" */
         private val RESUME_WORDS = setOf("继续", "接着做", "继续做", "继续吧", "接着")
+
+        /** 任务执行中，整句等于这些词就停手 */
+        private val STOP_WORDS = setOf(
+            "停", "停下", "停下来", "别做了", "不要了", "算了", "取消",
+            "停一下", "先停", "不用了", "停下吧"
+        )
 
         /** 有这些词才可能是"操作手机"的指令；都没有就老老实实当聊天处理 */
         private val ACTION_HINTS = listOf(
