@@ -77,15 +77,20 @@ class UpdateManager(private val context: Context) {
         scope.launch {
             _state.value = UpdateState.Checking
             runCatching {
-                val request = Request.Builder().url(url).build()
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        error("HTTP ${response.code}")
+                // GitHub 在国内经常解析得到却下不动，逐个换镜像试
+                var lastError: Throwable? = null
+                for (candidate in candidates(url)) {
+                    try {
+                        return@runCatching fetchText(candidate).let { body ->
+                            if (body.isBlank()) error("版本清单为空")
+                            json.decodeFromString<UpdateInfo>(body)
+                        }
+                    } catch (error: Throwable) {
+                        lastError = error
+                        Log.w(TAG, "manifest via $candidate failed", error)
                     }
-                    val body = response.body?.string().orEmpty()
-                    if (body.isBlank()) error("版本清单为空")
-                    json.decodeFromString<UpdateInfo>(body)
                 }
+                throw lastError ?: IllegalStateException("没有可用的下载地址")
             }.onSuccess { info ->
                 _state.value = if (info.versionCode > BuildConfig.VERSION_CODE) {
                     Log.i(TAG, "发现新版本 ${info.versionName}(${info.versionCode}) > ${BuildConfig.VERSION_NAME}")
@@ -117,44 +122,29 @@ class UpdateManager(private val context: Context) {
                 dir.mkdirs()
                 if (target.exists()) target.delete()
 
-                val request = Request.Builder().url(info.apkUrl).build()
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) error("HTTP ${response.code}")
-                    val body = response.body ?: error("响应为空")
-                    val total = body.contentLength()
-
-                    body.byteStream().use { input ->
-                        target.outputStream().use { output ->
-                            val buffer = ByteArray(64 * 1024)
-                            var received = 0L
-                            var lastPercent = -1
-                            while (true) {
-                                val read = input.read(buffer)
-                                if (read < 0) break
-                                output.write(buffer, 0, read)
-                                received += read
-                                if (total > 0) {
-                                    val percent = (received * 100 / total).toInt()
-                                    if (percent != lastPercent) {
-                                        lastPercent = percent
-                                        _state.value = UpdateState.Downloading(info, percent)
-                                    }
-                                }
+                var lastError: Throwable? = null
+                for (candidate in candidates(info.apkUrl)) {
+                    try {
+                        downloadTo(candidate, target, info)
+                        // 大小与 SHA-256 都对上才算成功，否则换下一个源重下
+                        if (info.size > 0 && target.length() != info.size) {
+                            error("文件大小不符（${target.length()} != ${info.size}），可能被截断")
+                        }
+                        if (info.sha256.isNotBlank()) {
+                            val actual = sha256(target)
+                            if (!actual.equals(info.sha256, ignoreCase = true)) {
+                                error("校验失败，安装包不完整或被篡改")
                             }
                         }
+                        Log.i(TAG, "download ok via $candidate")
+                        return@runCatching target
+                    } catch (error: Throwable) {
+                        lastError = error
+                        Log.w(TAG, "download via $candidate failed", error)
+                        runCatching { if (target.exists()) target.delete() }
                     }
                 }
-
-                if (info.size > 0 && target.length() != info.size) {
-                    error("文件大小不符（${target.length()} != ${info.size}），可能被截断")
-                }
-                if (info.sha256.isNotBlank()) {
-                    val actual = sha256(target)
-                    if (!actual.equals(info.sha256, ignoreCase = true)) {
-                        error("校验失败，安装包不完整或被篡改")
-                    }
-                }
-                target
+                throw lastError ?: IllegalStateException("下载源都不可用")
             }.onSuccess { apk ->
                 Log.i(TAG, "download done: ${apk.length()} bytes")
                 _state.value = UpdateState.Ready(info, apk)
@@ -211,6 +201,54 @@ class UpdateManager(private val context: Context) {
         }
     }
 
+    /**
+     * 下载源列表：GitHub 官方在前，镜像在后。
+     *
+     * 国内实测 GitHub 的 release 文件经常 21 秒超时（清单能拿到、包下不动），
+     * 而镜像能正常返回同一个文件；SHA-256 校验保证镜像给的东西没被改过。
+     */
+    private fun candidates(url: String): List<String> =
+        MIRROR_PREFIXES.map { prefix -> if (prefix.isEmpty()) url else prefix + url }
+
+    private fun fetchText(url: String): String {
+        val request = Request.Builder().url(url).build()
+        return client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("HTTP ${response.code}")
+            response.body?.string().orEmpty()
+        }
+    }
+
+    private fun downloadTo(url: String, target: File, info: UpdateInfo) {
+        val request = Request.Builder().url(url).build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("HTTP ${response.code}")
+            val body = response.body ?: error("响应为空")
+            val total = body.contentLength()
+
+            body.byteStream().use { input ->
+                target.outputStream().use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var received = 0L
+                    var lastPercent = -1
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        output.write(buffer, 0, read)
+                        received += read
+                        if (total > 0) {
+                            val percent = (received * 100 / total).toInt()
+                            if (percent != lastPercent) {
+                                lastPercent = percent
+                                _state.value = UpdateState.Downloading(info, percent)
+                            }
+                        }
+                    }
+                }
+            }
+            // 有些镜像直接返回 200 但内容是空壳 HTML，长度对不上会被上层挡掉
+        }
+    }
+
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().use { input ->
@@ -227,6 +265,14 @@ class UpdateManager(private val context: Context) {
     companion object {
         private const val TAG = "VoiceUpdate"
         private const val APK_NAME = "app-release.apk"
+
+        /** 空串 = 直连官方；其余是国内可用的 GitHub 加速镜像（前面拼接完整 URL） */
+        private val MIRROR_PREFIXES = listOf(
+            "",
+            "https://ghfast.top/",
+            "https://gh-proxy.com/",
+            "https://ghproxy.net/"
+        )
     }
 }
 
