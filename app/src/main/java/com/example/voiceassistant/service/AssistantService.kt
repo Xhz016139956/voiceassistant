@@ -432,6 +432,7 @@ class AssistantService : Service() {
             // 对话态里说两件事，同样先当任务办（判据同 parseIntent）
             if (result is ParseResult.Success &&
                 isSimpleAction(result.action) &&
+                looksLikePhoneTask(text) &&
                 TaskPlanner.isMultiStep(text)
             ) {
                 ServiceLocator.logRepository.add(
@@ -454,7 +455,7 @@ class AssistantService : Service() {
             }
 
             // 规则不认 → 先试多步执行；模型判断"这不是操作任务"才回到聊天
-            if (runAgentForTask(text)) return@launch
+            if (looksLikePhoneTask(text) && runAgentForTask(text)) return@launch
 
             // 规则不认 → 聊天
             AssistantStateBus.update { it.copy(statusText = "贾维斯在想…") }
@@ -604,6 +605,7 @@ class AssistantService : Service() {
             // 反过来，「提醒我三点，开会」这种复合指令本来就能吞下整句，不能被拆坏。
             if (result is ParseResult.Success &&
                 isSimpleAction(result.action) &&
+                looksLikePhoneTask(text) &&
                 TaskPlanner.isMultiStep(text)
             ) {
                 ServiceLocator.logRepository.add(
@@ -640,7 +642,7 @@ class AssistantService : Service() {
                     )
                     // 规则不认的句子以前直接"没听懂"，现在先当任务试一次：
                     // 模型能拆步骤就真的去做（这才是"能干活"）
-                    if (runAgentForTask(text)) return@launch
+                    if (looksLikePhoneTask(text) && runAgentForTask(text)) return@launch
 
                     AssistantStateBus.update { it.copy(statusText = "没听懂") }
                     toast("没听懂：${text}")
@@ -669,6 +671,15 @@ class AssistantService : Service() {
         scope.launch { runPlan(saved) }
         return true
     }
+
+    /**
+     * 这句话里有没有"动手机"的意思。
+     *
+     * 为什么需要：1.7B 这类小模型在"不该动手机"时会硬选一个动作（实测：问它
+     * "AI 会不会取代程序员"，它输出的是点「发送」）。所以聊天类的话根本不进 agent，
+     * 从源头堵住乱点。
+     */
+    private fun looksLikePhoneTask(text: String): Boolean = ACTION_HINTS.any { text.contains(it) }
 
     /**
      * "只能吃掉半句"的简单动作。
@@ -1119,6 +1130,15 @@ class AssistantService : Service() {
 
         /** 整句等于这些词才算"继续上次任务" */
         private val RESUME_WORDS = setOf("继续", "接着做", "继续做", "继续吧", "接着")
+
+        /** 有这些词才可能是"操作手机"的指令；都没有就老老实实当聊天处理 */
+        private val ACTION_HINTS = listOf(
+            "打开", "启动", "运行", "进入", "关掉", "关闭",
+            "点", "按", "选", "输入", "打字", "发送", "发出去", "发消息", "发个",
+            "滑", "翻", "返回", "回桌面", "回主屏",
+            "音量", "声音", "静音", "读屏", "念一下", "读一下",
+            "提醒", "设个", "闹钟", "帮我"
+        )
 
         /** 卡片可见时，整句等于这些词才算作答，避免误伤正常指令 */
         private val CONFIRM_WORDS = setOf("确认", "确定", "执行", "好的", "好", "可以", "是", "对")

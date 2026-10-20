@@ -121,6 +121,19 @@ class TaskAgent(
                         lastSignature = signature
                     }
 
+                    // 序号校验：小模型会凭空点一个屏幕上不存在的序号（实测过），
+                    // 这种动作不能执行——让它重新看屏幕再选
+                    val clickIndex = (step.action as? Action.ClickIndex)?.index
+                    if (clickIndex != null) {
+                        val maxIndex = maxClickableIndex(screen)
+                        if (clickIndex > maxIndex) {
+                            onStep("第${index + 1}步：序号 $clickIndex 越界（屏幕只有 $maxIndex 个）")
+                            steps += Executed(description, "序号越界：屏幕只有 $maxIndex 个可点击元素")
+                            index++
+                            continue
+                        }
+                    }
+
                     if (isDangerous(step.action)) {
                         val ok = confirm(step.action, "第${index + 1}步要${description}，确认吗？")
                         if (!ok) return Outcome.Failed("已取消", steps)
@@ -142,6 +155,11 @@ class TaskAgent(
 
     private fun isDangerous(action: Action): Boolean =
         action is Action.SendMessage || DangerRules.isDangerous(action.describe())
+
+    /** 屏幕快照里最大的可点击序号；0 表示一个都没有 */
+    private fun maxClickableIndex(snapshot: String): Int =
+        Regex("(?m)^(\\d+)\\. ").findAll(snapshot)
+            .maxOfOrNull { it.groupValues[1].toIntOrNull() ?: 0 } ?: 0
 
     private fun buildUserPrompt(task: String, steps: List<Executed>, screen: String): String =
         buildString {
@@ -243,6 +261,16 @@ class TaskAgent(
             7. 任务完成立即输出 done，summary 一句话，会被念出来，别超过 30 字。
             8. 只有确实缺关键信息（找谁、发什么、第几个）才用 ask。
             9. 用户只是聊天、问问题、不要你动手机 → 输出 {"action":"none"}。
+
+            示例（照这个来）：
+            - 任务「发送」，屏幕可点击：1.[输入框] 怎么使用AI  2.发送
+              输出 {"action":"click_index","index":2}
+            - 任务「打开微信」，屏幕可点击：1.设置  2.微信  3.抖音
+              输出 {"action":"click_index","index":2}
+            - 任务「你觉得AI会取代程序员吗」，屏幕是桌面
+              输出 {"action":"none"}
+            - 任务「输入你好」，屏幕可点击：1.[输入框] 说点什么  2.发送
+              输出 {"action":"click_index","index":1}
         """.trimIndent()
     }
 }
