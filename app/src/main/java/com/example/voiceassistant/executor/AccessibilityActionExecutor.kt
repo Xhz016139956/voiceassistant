@@ -433,19 +433,25 @@ class AccessibilityActionExecutor(
 
     // ---------------- 输入文字 ----------------
 
-    private fun inputText(text: String): ExecResult {
+    private suspend fun inputText(text: String): ExecResult {
         val root = rootNode() ?: return ExecResult.failure(NEED_SERVICE)
         if (text.isEmpty()) return ExecResult.failure("没有要输入的内容")
 
-        val focused = runCatching { root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }
-            .getOrNull()
-            ?: findFirstEditable(root)
+        val focused = runCatching { root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }.getOrNull()
+        val target = focused ?: findFirstEditable(root)
             ?: return ExecResult.failure("没有找到输入框，请先点一下输入区域")
+
+        // 没聚焦就先点一下：不少输入框在未聚焦时 SET_TEXT 会静默失败，
+        // 表现出来就是"说输入了，屏幕上啥也没有"
+        if (focused == null) {
+            clickNode(target)
+            delay(300)
+        }
 
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        val ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        val ok = target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
         return if (ok) ExecResult.success("已输入「$text」")
         else ExecResult.failure("输入失败，该输入框可能不支持直接赋值")
     }

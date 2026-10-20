@@ -67,6 +67,10 @@ class RuleParser {
         //    否则「打开微信给老王发消息说晚上吃饭」会被当成打开一个叫「微信给老王…」的应用）
         parseSendMessage(text)?.let { return it }
 
+        // 8.5 光说「发送」= 按当前界面的发送键。
+        // 多步任务里这很常见：「打开X，输入问题，然后发送」——拆开后最后一段就是这个字
+        if (text in SEND_WORDS) return Action.ClickText("发送", text)
+
         // 9. 打开应用
         OPEN_REGEX.find(text)?.let { match ->
             val name = cleanTarget(match.groupValues[1])
@@ -188,8 +192,14 @@ class RuleParser {
     companion object {
         private val INDEX_REGEX = Regex("""第\s*([0-9一二两三四五六七八九十]+)\s*个""")
         private val INPUT_REGEX = Regex("""^(?:帮我|请|麻烦)?\s*(?:输入|打字)\s*(.+)$""")
-        private val OPEN_REGEX = Regex("""^(?:帮我|请|麻烦)?\s*(?:打开|启动|运行|进入)\s*(?:一下)?\s*(.+)$""")
-        private val CLICK_REGEX = Regex("""^(?:点击|点一下|点|按一下|按|选择)\s*(.+)$""")
+
+        // 应用名/点击目标到逗号为止：否则「打开deepseek，输入问题」
+        // 会把「deepseek，输入问题」整个当成应用名（真踩过）
+        private val OPEN_REGEX = Regex("""^(?:帮我|请|麻烦)?\s*(?:打开|启动|运行|进入)\s*(?:一下)?\s*([^，,]+)""")
+        private val CLICK_REGEX = Regex("""^(?:点击|点一下|点|按一下|按|选择)\s*([^，,]+)""")
+
+        /** 单独说「发送」时的几种说法 */
+        private val SEND_WORDS = setOf("发送", "发出去", "发送消息", "点发送", "按发送", "按下发送")
         private val REMIND_REGEX = Regex("""^(?:提醒我|设个提醒|提醒|记一下)\s*(.+)$""")
 
         private const val DEFAULT_MESSAGE_APP = "微信"

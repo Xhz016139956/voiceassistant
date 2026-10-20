@@ -1,9 +1,34 @@
 package com.example.voiceassistant.agent
 
+import com.example.voiceassistant.intent.Action
+import com.example.voiceassistant.intent.RuleParser
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TaskPlannerTest {
+
+    @Test
+    fun `逗号也是分隔符`() {
+        assertEquals(
+            listOf("打开deepseek", "输入怎么使用AI", "发送"),
+            TaskPlanner.split("打开deepseek，输入怎么使用AI，然后发送")
+        )
+    }
+
+    @Test
+    fun `应用名不吃掉逗号后面的内容`() {
+        val action = RuleParser().parse("打开deepseek，输入怎么使用AI")
+        assertTrue("应为打开应用，实际 $action", action is Action.OpenApp)
+        assertEquals("deepseek", (action as Action.OpenApp).appName)
+    }
+
+    @Test
+    fun `单独说发送就是点发送按钮`() {
+        val action = RuleParser().parse("发送")
+        assertTrue(action is Action.ClickText)
+        assertEquals("发送", (action as Action.ClickText).text)
+    }
 
     @Test
     fun `顺序词切成两个子目标`() {
