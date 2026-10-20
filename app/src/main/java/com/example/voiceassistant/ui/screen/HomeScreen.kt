@@ -562,11 +562,25 @@ private fun UpdateCard(
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "当前 ${BuildConfig.VERSION_NAME}",
+                    text = "当前 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
+            // 把「这个包绑定的更新源」直接摊开：出问题时一眼能看出装的是哪个包，
+            // 不必再靠猜（空串=本地构建没注入 updateRepo，检查更新必然失败）
+            Text(
+                text = BuildConfig.UPDATE_REPO.takeIf { it.isNotBlank() }
+                    ?.let { "更新源：github.com/$it" }
+                    ?: "更新源：未配置（这个包是没注入 updateRepo 的本地构建）",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (BuildConfig.UPDATE_REPO.isBlank()) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
 
             when (state) {
                 UpdateState.Idle -> Text(
