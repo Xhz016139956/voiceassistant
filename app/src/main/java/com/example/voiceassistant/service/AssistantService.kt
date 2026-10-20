@@ -429,6 +429,17 @@ class AssistantService : Service() {
             val result = withContext(Dispatchers.IO) { intentParser.parse(text) }
             val cost = SystemClock.elapsedRealtime() - startedAt
 
+            // 对话态里说两件事，同样先当任务办（判据同 parseIntent）
+            if (result is ParseResult.Success &&
+                isSimpleAction(result.action) &&
+                TaskPlanner.isMultiStep(text)
+            ) {
+                ServiceLocator.logRepository.add(
+                    LogStage.INTENT, "识别为多步任务", input = text, costMillis = cost
+                )
+                if (runAgentForTask(text)) return@launch
+            }
+
             if (result is ParseResult.Success) {
                 val action = result.action
                 ServiceLocator.logRepository.add(
@@ -582,12 +593,24 @@ class AssistantService : Service() {
         if (handleSpokenConfirm(text)) return
 
         scope.launch {
+            // 新指令进来，上一句待确认的操作作废（先结算，避免卡片留着挡视线）
+            confirmDialog.cancel()
+
             val startedAt = SystemClock.elapsedRealtime()
             val result = withContext(Dispatchers.IO) { intentParser.parse(text) }
             val cost = SystemClock.elapsedRealtime() - startedAt
 
-            // 新指令进来，上一句待确认的操作作废（先结算，避免卡片留着挡视线）
-            confirmDialog.cancel()
+            // 多步判定：只有「整句被一个简单动作吃掉、但句里其实有好几件事」才转任务引擎。
+            // 反过来，「提醒我三点，开会」这种复合指令本来就能吞下整句，不能被拆坏。
+            if (result is ParseResult.Success &&
+                isSimpleAction(result.action) &&
+                TaskPlanner.isMultiStep(text)
+            ) {
+                ServiceLocator.logRepository.add(
+                    LogStage.INTENT, "识别为多步任务", input = text, costMillis = cost
+                )
+                if (runAgentForTask(text)) return@launch
+            }
 
             when (result) {
                 is ParseResult.Success -> {
@@ -647,6 +670,20 @@ class AssistantService : Service() {
         return true
     }
 
+    /**
+     * "只能吃掉半句"的简单动作。
+     *
+     * 这类动作一旦命中，句子里剩下的内容就丢了——所以只有它们才需要多步纠偏；
+     * 而 SendMessage / InputText / Notify 天生能吞掉整句（消息内容、输入内容本来就在里面），
+     * 不能拆，拆了反而坏。
+     */
+    private fun isSimpleAction(action: Action): Boolean = when (action) {
+        is Action.OpenApp, is Action.ClickText, is Action.ClickIndex,
+        is Action.Swipe, is Action.Volume, is Action.Back, is Action.Home -> true
+
+        else -> false
+    }
+
     // ---------------- 多步任务执行（"能干活"的那一环） ----------------
 
     /**
@@ -660,9 +697,8 @@ class AssistantService : Service() {
      * @return true 表示已处理掉；false 表示模型判定这不是操作手机的任务（调用方回去聊天）
      */
     private suspend fun runAgentForTask(text: String): Boolean {
-        val settings = ServiceLocator.jarvisSettings
-        if (!settings.llmConfigured) return false
-
+        // 这里**不**要求模型已配置：全是规则能办的子任务（打开应用/输入/发送）
+        // 不需要模型，没配也该能做。真需要模型的那一步会在 runSubtask 里明确报出来。
         if (ServiceLocator.accessibilityService == null) {
             ServiceLocator.logRepository.add(
                 LogStage.SYSTEM,
@@ -799,6 +835,11 @@ class AssistantService : Service() {
             }
 
             is ParseResult.Rejected -> Unit
+        }
+
+        // 走到这里说明规则接不住，只能靠模型；没配就明确说清楚，别装作在干活
+        if (!ServiceLocator.jarvisSettings.llmConfigured) {
+            return SubtaskResult.Fail("这一步得靠模型，先在设置里填模型地址和模型名")
         }
 
         val agent = TaskAgent(

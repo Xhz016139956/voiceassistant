@@ -37,13 +37,39 @@ object TaskPlanner {
         val text = utterance.trim()
         if (text.isEmpty()) return emptyList()
 
-        val pieces = splitOutsideQuotes(text)
+        val firstPass = splitOutsideQuotes(text)
             .map { clean(it) }
             .filter { it.length >= 2 }
+
+        // 第二遍：没逗号的连说也要断，比如「打开deepseek输入怎么使用AI」
+        val pieces = ArrayList<String>(firstPass.size)
+        for (piece in firstPass) pieces += splitBeforeVerb(piece)
 
         val result = if (pieces.size <= 1) listOf(clean(text)) else pieces
         return result.take(MAX_SUB_TASKS)
     }
+
+    /** 一句话里有几件事（>1 就不能当单动作执行） */
+    fun isMultiStep(utterance: String): Boolean = split(utterance).size > 1
+
+    /**
+     * 在「输入 / 打字」前断开：动作动词后面通常跟着参数，
+     * 而前面那半截往往已经是另一个动作了。
+     */
+    private fun splitBeforeVerb(piece: String): List<String> {
+        for (verb in VERBS) {
+            val at = piece.indexOf(verb)
+            if (at < 2) continue
+            val head = piece.substring(0, at).trim()
+            val tail = piece.substring(at).trim()
+            if (head.length >= 2 && tail.length > verb.length) {
+                return listOf(head, tail)
+            }
+        }
+        return listOf(piece)
+    }
+
+    private val VERBS = listOf("输入", "打字")
 
     /** 去掉句首客套话，否则「帮我打开微信」匹配不上规则里的「打开…」 */
     private val POLITE = listOf("请帮我", "帮我", "帮忙", "麻烦你", "麻烦", "请你", "请", "给我")

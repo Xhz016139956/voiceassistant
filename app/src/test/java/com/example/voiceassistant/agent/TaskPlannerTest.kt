@@ -9,6 +9,22 @@ import org.junit.Test
 class TaskPlannerTest {
 
     @Test
+    fun `没有逗号也要在输入前断开`() {
+        assertEquals(
+            listOf("打开deepseek", "输入怎么使用AI"),
+            TaskPlanner.split("打开deepseek输入怎么使用AI")
+        )
+    }
+
+    @Test
+    fun `多步判定`() {
+        assertTrue(TaskPlanner.isMultiStep("打开deepseek，输入怎么使用AI，然后发送"))
+        assertTrue(TaskPlanner.isMultiStep("打开微信然后给老王发消息说晚上吃饭"))
+        assertEquals(false, TaskPlanner.isMultiStep("打开微信"))
+        assertEquals(false, TaskPlanner.isMultiStep("输入你好"))
+    }
+
+    @Test
     fun `逗号也是分隔符`() {
         assertEquals(
             listOf("打开deepseek", "输入怎么使用AI", "发送"),
